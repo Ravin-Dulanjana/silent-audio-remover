@@ -1,0 +1,20 @@
+# Python cache and test artifacts
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+
+# Local calibration/output artifacts
+tuned_settings.json
+
+# Media files and rendered samples
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.m4a
+
+# OS/editor noise
+.DS_Store
