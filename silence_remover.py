@@ -45,8 +45,28 @@ class SilenceRemoverError(RuntimeError):
     pass
 
 
+class ProcessingCancelled(SilenceRemoverError):
+    pass
+
+
 def _default_logger(message: str) -> None:
     print(message)
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessingCancelled("Processing stopped.")
+
+
+def _stop_process(proc: subprocess.Popen[object]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=1.0)
 
 
 def _ensure_binaries() -> tuple[str, str]:
@@ -237,6 +257,7 @@ def _detect_silences_adaptive(
     ffprobe: str,
     input_path: Path,
     settings: SilenceSettings,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> tuple[float, list[tuple[float, float]], bool, bool]:
     duration, has_video, has_audio = _probe_media(ffprobe, input_path)
@@ -266,9 +287,27 @@ def _detect_silences_adaptive(
         "s16le",
         "pipe:1",
     ]
-    raw = subprocess.check_output(cmd)
-    if progress is not None:
-        progress(55.0)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert proc.stdout is not None
+    expected_bytes = max(1.0, duration * sample_rate * 2.0)
+    chunks: list[bytes] = []
+    bytes_read = 0
+    while True:
+        _check_cancel(cancel_event)
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        bytes_read += len(chunk)
+        if progress is not None:
+            progress(min(100.0, (bytes_read / expected_bytes) * 100.0))
+    code = proc.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        _stop_process(proc)
+        raise ProcessingCancelled("Processing stopped.")
+    if code != 0:
+        raise SilenceRemoverError(f"ffmpeg adaptive detection failed with exit code {code}.")
+    raw = b"".join(chunks)
     pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     speech, frame_sec = _pcm_to_speech_mask(pcm, sample_rate, settings)
     silences = _speech_mask_to_silences(speech, frame_sec, duration)
@@ -281,11 +320,14 @@ def detect_silences(
     input_path: Path,
     settings: SilenceSettings,
     detector: str = "adaptive",
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> tuple[float, list[tuple[float, float]], bool, bool]:
     ffmpeg, ffprobe = _ensure_binaries()
     if detector == "adaptive":
-        return _detect_silences_adaptive(ffmpeg, ffprobe, input_path, settings, progress)
+        return _detect_silences_adaptive(
+            ffmpeg, ffprobe, input_path, settings, cancel_event, progress
+        )
     if detector != "ffmpeg":
         raise SilenceRemoverError("detector must be 'adaptive' or 'ffmpeg'.")
     duration, has_video, has_audio = _probe_media(ffprobe, input_path)
@@ -328,6 +370,7 @@ def detect_silences(
     lines: list[str] = []
     assert proc.stdout is not None
     for line in proc.stdout:
+        _check_cancel(cancel_event)
         line = line.strip()
         if not line:
             continue
@@ -340,6 +383,9 @@ def detect_silences(
                 pass
 
     code = proc.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        _stop_process(proc)
+        raise ProcessingCancelled("Processing stopped.")
     if code != 0:
         raise SilenceRemoverError(f"ffmpeg silencedetect failed with exit code {code}.")
     raw = "\n".join(lines)
@@ -426,6 +472,7 @@ def _run_ffmpeg_progress(
     cmd: Sequence[str],
     duration: float,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> int:
     proc = subprocess.Popen(
@@ -453,6 +500,7 @@ def _run_ffmpeg_progress(
 
     assert proc.stdout is not None
     for line in proc.stdout:
+        _check_cancel(cancel_event)
         line = line.strip()
         if not line:
             continue
@@ -475,7 +523,11 @@ def _run_ffmpeg_progress(
             continue
 
         log(line)
-    return proc.wait()
+    code = proc.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        _stop_process(proc)
+        raise ProcessingCancelled("Processing stopped.")
+    return code
 
 
 def _segment_duration(segments: Sequence[tuple[float, float]]) -> float:
@@ -513,6 +565,7 @@ def _render_with_concat_copy(
     duration: float,
     turbo: bool,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> None:
     if not keep_segments:
@@ -567,12 +620,20 @@ def _render_with_concat_copy(
             return c
 
         code = _run_ffmpeg_progress(
-            _finish_cmd(use_hw_encode), duration=duration, log=log, progress=progress
+            _finish_cmd(use_hw_encode),
+            duration=duration,
+            log=log,
+            cancel_event=cancel_event,
+            progress=progress,
         )
         if code != 0 and use_hw_encode:
             log("Fast mode hardware encode failed, retrying with software encoder (libx264).")
             code = _run_ffmpeg_progress(
-                _finish_cmd(False), duration=duration, log=log, progress=progress
+                _finish_cmd(False),
+                duration=duration,
+                log=log,
+                cancel_event=cancel_event,
+                progress=progress,
             )
         if code != 0:
             raise SilenceRemoverError(f"ffmpeg fast render failed with exit code {code}.")
@@ -588,6 +649,7 @@ def _render_with_ffmpeg_singlepass(
     duration: float,
     turbo: bool,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> None:
     if not keep_segments:
@@ -660,11 +722,15 @@ def _render_with_ffmpeg_singlepass(
             return cmd
 
         cmd = _build_cmd(use_hw=use_hw_encode)
-        code = _run_ffmpeg_progress(cmd, duration=duration, log=log, progress=progress)
+        code = _run_ffmpeg_progress(
+            cmd, duration=duration, log=log, cancel_event=cancel_event, progress=progress
+        )
         if code != 0 and use_hw_encode:
             log("Hardware encode failed, retrying with software encoder (libx264).")
             cmd = _build_cmd(use_hw=False)
-            code = _run_ffmpeg_progress(cmd, duration=duration, log=log, progress=progress)
+            code = _run_ffmpeg_progress(
+                cmd, duration=duration, log=log, cancel_event=cancel_event, progress=progress
+            )
 
         if code != 0:
             raise SilenceRemoverError(f"ffmpeg render failed with exit code {code}.")
@@ -683,6 +749,7 @@ def _render_with_ffmpeg_batched(
     duration: float,
     turbo: bool,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
     max_segments_per_pass: int = 48,
 ) -> None:
@@ -698,6 +765,7 @@ def _render_with_ffmpeg_batched(
             duration=duration,
             turbo=turbo,
             log=log,
+            cancel_event=cancel_event,
             progress=progress,
         )
         return
@@ -715,6 +783,7 @@ def _render_with_ffmpeg_batched(
         completed_weight = 0.0
 
         for idx, group in enumerate(groups):
+            _check_cancel(cancel_event)
             span_start, span_end = _segment_source_span(group)
             label = (
                 f"Batch {idx + 1}/{len(groups)} "
@@ -738,6 +807,7 @@ def _render_with_ffmpeg_batched(
                 duration=max(0.001, group_weights[idx]),
                 turbo=turbo,
                 log=lambda _msg: None,
+                cancel_event=cancel_event,
                 progress=_batch_progress,
             )
             completed_weight += group_weights[idx]
@@ -752,6 +822,7 @@ def _render_with_ffmpeg_batched(
             output_path=output_path,
             duration=duration,
             log=log,
+            cancel_event=cancel_event,
             progress=progress,
         )
 
@@ -766,6 +837,7 @@ def _render_with_ffmpeg(
     duration: float,
     turbo: bool,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> None:
     max_segments_per_pass = 48
@@ -780,6 +852,7 @@ def _render_with_ffmpeg(
             duration=duration,
             turbo=turbo,
             log=log,
+            cancel_event=cancel_event,
             progress=progress,
             max_segments_per_pass=max_segments_per_pass,
         )
@@ -794,6 +867,7 @@ def _render_with_ffmpeg(
         duration=duration,
         turbo=turbo,
         log=log,
+        cancel_event=cancel_event,
         progress=progress,
     )
 
@@ -829,6 +903,7 @@ def _concat_parts_copy(
     output_path: Path,
     duration: float,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> None:
     if not part_paths:
@@ -863,7 +938,9 @@ def _concat_parts_copy(
             "+faststart",
             str(output_path),
         ]
-        code = _run_ffmpeg_progress(cmd, duration=duration, log=log, progress=progress)
+        code = _run_ffmpeg_progress(
+            cmd, duration=duration, log=log, cancel_event=cancel_event, progress=progress
+        )
         if code != 0:
             raise SilenceRemoverError(f"ffmpeg concat failed with exit code {code}.")
 
@@ -878,6 +955,7 @@ def _render_with_ffmpeg_parallel(
     duration: float,
     parallel_jobs: int,
     log: LogFn,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> None:
     groups = _split_segments_for_parallel(keep_segments, parallel_jobs)
@@ -892,6 +970,7 @@ def _render_with_ffmpeg_parallel(
             duration=duration,
             turbo=False,
             log=log,
+            cancel_event=cancel_event,
             progress=progress,
         )
         return
@@ -924,6 +1003,7 @@ def _render_with_ffmpeg_parallel(
             log(f"{label} started")
 
             def _chunk_progress(pct: float) -> None:
+                _check_cancel(cancel_event)
                 with lock:
                     chunk_progress[idx] = max(0.0, min(1.0, pct / 100.0))
                     bucket = int(pct // 10)
@@ -942,6 +1022,7 @@ def _render_with_ffmpeg_parallel(
                 duration=max(0.001, chunk_weights[idx]),
                 turbo=False,
                 log=lambda _msg: None,
+                cancel_event=cancel_event,
                 progress=_chunk_progress,
             )
             with lock:
@@ -965,6 +1046,7 @@ def _render_with_ffmpeg_parallel(
             output_path=output_path,
             duration=duration,
             log=log,
+            cancel_event=cancel_event,
             progress=progress,
         )
 
@@ -980,6 +1062,7 @@ def process_media(
     accurate_merge_gap: float = 0.08,
     parallel_jobs: int = 1,
     log: LogFn = _default_logger,
+    cancel_event: threading.Event | None = None,
     progress: ProgressFn | None = None,
 ) -> ProcessResult:
     input_file = Path(input_path).expanduser().resolve()
@@ -991,90 +1074,64 @@ def process_media(
     if progress is not None:
         progress(0.0)
 
-    ffmpeg, ffprobe = _ensure_binaries()
-    if detector == "adaptive":
-        log("Analyzing audio track with adaptive speech detection...")
-    else:
-        log("Analyzing audio track for silence...")
-    duration, silences, has_video, has_audio = detect_silences(
-        input_file,
-        settings,
-        detector=detector,
-        progress=(lambda p: progress(min(20.0, p * 0.2))) if progress is not None else None,
-    )
-    keep_segments = build_keep_segments(duration, silences, settings)
-
-    if not keep_segments:
-        raise SilenceRemoverError(
-            "All detected segments were below the minimum keep length.\n"
-            "Try reducing 'Ignore Detections Shorter Than'."
-        )
-
-    render_segments = keep_segments
-    if render_mode == "fast":
-        render_segments = _merge_short_gaps(keep_segments, max(0.0, fast_merge_gap))
-        log(
-            f"Fast mode merged close cuts: {len(keep_segments)} -> {len(render_segments)} segments"
-        )
-    elif render_mode == "accurate":
-        if accurate_merge_gap > 0.0:
-            merged_segments = _merge_short_gaps(keep_segments, accurate_merge_gap)
-            if len(merged_segments) != len(keep_segments):
-                log(
-                    "Speed merge applied in standard mode: "
-                    f"{len(keep_segments)} -> {len(merged_segments)} segments "
-                    f"(gap <= {accurate_merge_gap:.2f}s)"
-                )
-            render_segments = merged_segments
-    else:
-        raise SilenceRemoverError("render_mode must be 'accurate' or 'fast'.")
-
-    kept_duration = sum(end - start for start, end in render_segments)
-    removed_duration = max(0.0, duration - kept_duration)
-
-    log(f"Input: {input_file.name}")
-    log(f"Input duration: {_format_time(duration)}")
-    log(f"Detected silences: {len(silences)}")
-    log(f"Kept segments: {len(render_segments)}")
-    log(f"Estimated removed: {_format_time(removed_duration)}")
-
-    render_progress = (
-        (lambda p: progress(min(100.0, 20.0 + (p * 0.8)))) if progress is not None else None
-    )
-
-    if render_mode == "fast":
-        log("Rendering output with concat-based pass...")
-        _render_with_concat_copy(
-            ffmpeg=ffmpeg,
-            input_path=input_file,
-            output_path=output_file,
-            keep_segments=render_segments,
-            has_video=has_video,
-            has_audio=has_audio,
-            duration=max(0.001, kept_duration),
-            turbo=turbo,
-            log=log,
-            progress=render_progress,
-        )
-    else:
-        if parallel_jobs > 1:
-            if turbo:
-                log("Turbo is disabled in parallel mode for stability.")
-            _render_with_ffmpeg_parallel(
-                ffmpeg=ffmpeg,
-                input_path=input_file,
-                output_path=output_file,
-                keep_segments=render_segments,
-                has_video=has_video,
-                has_audio=has_audio,
-                duration=max(0.001, kept_duration),
-                parallel_jobs=parallel_jobs,
-                log=log,
-                progress=render_progress,
-            )
+    try:
+        ffmpeg, ffprobe = _ensure_binaries()
+        _check_cancel(cancel_event)
+        if detector == "adaptive":
+            log("Analyzing audio track with adaptive speech detection...")
         else:
-            log("Rendering selected spans in a single pass...")
-            _render_with_ffmpeg(
+            log("Analyzing audio track for silence...")
+        duration, silences, has_video, has_audio = detect_silences(
+            input_file,
+            settings,
+            detector=detector,
+            cancel_event=cancel_event,
+            progress=(lambda p: progress(min(20.0, p * 0.2))) if progress is not None else None,
+        )
+        _check_cancel(cancel_event)
+        keep_segments = build_keep_segments(duration, silences, settings)
+
+        if not keep_segments:
+            raise SilenceRemoverError(
+                "All detected segments were below the minimum keep length.\n"
+                "Try reducing 'Ignore Detections Shorter Than'."
+            )
+
+        render_segments = keep_segments
+        if render_mode == "fast":
+            render_segments = _merge_short_gaps(keep_segments, max(0.0, fast_merge_gap))
+            log(
+                f"Fast mode merged close cuts: {len(keep_segments)} -> {len(render_segments)} segments"
+            )
+        elif render_mode == "accurate":
+            if accurate_merge_gap > 0.0:
+                merged_segments = _merge_short_gaps(keep_segments, accurate_merge_gap)
+                if len(merged_segments) != len(keep_segments):
+                    log(
+                        "Speed merge applied in standard mode: "
+                        f"{len(keep_segments)} -> {len(merged_segments)} segments "
+                        f"(gap <= {accurate_merge_gap:.2f}s)"
+                    )
+                render_segments = merged_segments
+        else:
+            raise SilenceRemoverError("render_mode must be 'accurate' or 'fast'.")
+
+        kept_duration = sum(end - start for start, end in render_segments)
+        removed_duration = max(0.0, duration - kept_duration)
+
+        log(f"Input: {input_file.name}")
+        log(f"Input duration: {_format_time(duration)}")
+        log(f"Detected silences: {len(silences)}")
+        log(f"Kept segments: {len(render_segments)}")
+        log(f"Estimated removed: {_format_time(removed_duration)}")
+
+        render_progress = (
+            (lambda p: progress(min(100.0, 20.0 + (p * 0.8)))) if progress is not None else None
+        )
+
+        if render_mode == "fast":
+            log("Rendering output with concat-based pass...")
+            _render_with_concat_copy(
                 ffmpeg=ffmpeg,
                 input_path=input_file,
                 output_path=output_file,
@@ -1084,21 +1141,59 @@ def process_media(
                 duration=max(0.001, kept_duration),
                 turbo=turbo,
                 log=log,
+                cancel_event=cancel_event,
                 progress=render_progress,
             )
+        else:
+            if parallel_jobs > 1:
+                if turbo:
+                    log("Turbo is disabled in parallel mode for stability.")
+                _render_with_ffmpeg_parallel(
+                    ffmpeg=ffmpeg,
+                    input_path=input_file,
+                    output_path=output_file,
+                    keep_segments=render_segments,
+                    has_video=has_video,
+                    has_audio=has_audio,
+                    duration=max(0.001, kept_duration),
+                    parallel_jobs=parallel_jobs,
+                    log=log,
+                    cancel_event=cancel_event,
+                    progress=render_progress,
+                )
+            else:
+                log("Rendering selected spans in a single pass...")
+                _render_with_ffmpeg(
+                    ffmpeg=ffmpeg,
+                    input_path=input_file,
+                    output_path=output_file,
+                    keep_segments=render_segments,
+                    has_video=has_video,
+                    has_audio=has_audio,
+                    duration=max(0.001, kept_duration),
+                    turbo=turbo,
+                    log=log,
+                    cancel_event=cancel_event,
+                    progress=render_progress,
+                )
 
-    output_duration, _, _ = _probe_media(ffprobe, output_file)
-    if progress is not None:
-        progress(100.0)
+        _check_cancel(cancel_event)
+        output_duration, _, _ = _probe_media(ffprobe, output_file)
+        if progress is not None:
+            progress(100.0)
 
-    return ProcessResult(
-        input_duration=duration,
-        output_duration=output_duration,
-        removed_duration=max(0.0, duration - output_duration),
-        segments_kept=len(render_segments),
-        silences_detected=len(silences),
-        output_path=output_file,
-    )
+        return ProcessResult(
+            input_duration=duration,
+            output_duration=output_duration,
+            removed_duration=max(0.0, duration - output_duration),
+            segments_kept=len(render_segments),
+            silences_detected=len(silences),
+            output_path=output_file,
+        )
+    except ProcessingCancelled:
+        if output_file.exists():
+            output_file.unlink(missing_ok=True)
+        raise
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1186,6 +1281,7 @@ def main() -> int:
             accurate_merge_gap=max(0.0, args.accurate_merge_gap),
             parallel_jobs=max(1, args.parallel_jobs),
             log=_default_logger,
+            cancel_event=None,
             progress=_cli_progress,
         )
     except SilenceRemoverError as exc:

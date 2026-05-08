@@ -18,3 +18,8 @@ tuned_settings.json
 
 # OS/editor noise
 .DS_Store
+
+# Standalone app build outputs
+build/
+dist/
+*.spec

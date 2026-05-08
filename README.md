@@ -10,6 +10,7 @@ The project includes:
 - live progress percentage and active processing status
 - fast single-pass rendering for precise exports
 - an adaptive speech-style detector for stronger silence removal
+- a stop button for cancelling active exports
 - a calibration tool for matching a reference output
 
 ## Why this project exists
@@ -109,6 +110,7 @@ From the app you can:
 - edit silence-detection settings
 - use the default fast single-pass renderer
 - use the adaptive detector by default
+- stop an export that is already running
 - load tuned settings from a JSON file
 - watch live progress and current processing stage
 
@@ -189,6 +191,7 @@ The desktop app in [app.py](/Users/ravinfernando/dev/silent-audio-remover/app.py
 - `Turbo Encode`: attempts hardware encoding where possible
 - `Concat Mode`: faster but less exact output timing
 - `Parallel Jobs`: advanced chunk rendering workers
+- `Stop`: cancels the active export and cleans up partial output
 
 ### Progress display
 
@@ -260,6 +263,47 @@ Use the `Load Tuned JSON` button and select the generated `tuned_settings.json`.
 - [silence_remover.py](/Users/ravinfernando/dev/silent-audio-remover/silence_remover.py): core processing engine and CLI
 - [calibrate_to_reference.py](/Users/ravinfernando/dev/silent-audio-remover/calibrate_to_reference.py): reference-based tuning utility
 - [test_segments.py](/Users/ravinfernando/dev/silent-audio-remover/test_segments.py): tests for segment calculation logic
+- [packaging/build_mac.sh](/Users/ravinfernando/dev/silent-audio-remover/packaging/build_mac.sh): macOS standalone app build script
+- [packaging/build_windows.bat](/Users/ravinfernando/dev/silent-audio-remover/packaging/build_windows.bat): Windows standalone app build script
+- [packaging/requirements-build.txt](/Users/ravinfernando/dev/silent-audio-remover/packaging/requirements-build.txt): build dependency list
+
+## Standalone app builds
+
+You can package the GUI as a standalone desktop app with `PyInstaller`.
+
+### Install build dependency
+
+```bash
+pip install -r packaging/requirements-build.txt
+```
+
+### Build macOS app
+
+```bash
+bash packaging/build_mac.sh
+```
+
+This produces:
+
+```text
+dist/Silence Remover.app
+```
+
+### Build Windows app
+
+Run this on a Windows machine:
+
+```bat
+packaging\build_windows.bat
+```
+
+This produces a Windows standalone app build under:
+
+```text
+dist\Silence Remover\
+```
+
+Note: the Windows standalone app path is included for users, but it has not been tested by the project author yet.
 
 ## Testing
 
