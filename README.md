@@ -265,7 +265,9 @@ Use the `Load Tuned JSON` button and select the generated `tuned_settings.json`.
 - [test_segments.py](/Users/ravinfernando/dev/silent-audio-remover/test_segments.py): tests for segment calculation logic
 - [packaging/build_mac.sh](/Users/ravinfernando/dev/silent-audio-remover/packaging/build_mac.sh): macOS standalone app build script
 - [packaging/build_windows.bat](/Users/ravinfernando/dev/silent-audio-remover/packaging/build_windows.bat): Windows standalone app build script
+- [packaging/generate_icons.py](/Users/ravinfernando/dev/silent-audio-remover/packaging/generate_icons.py): generates the packaged app icons
 - [packaging/requirements-build.txt](/Users/ravinfernando/dev/silent-audio-remover/packaging/requirements-build.txt): build dependency list
+- [packaging/version.txt](/Users/ravinfernando/dev/silent-audio-remover/packaging/version.txt): packaged app version number
 
 ## Standalone app builds
 
@@ -277,7 +279,7 @@ You can package the GUI as a standalone desktop app with `PyInstaller`.
 pip install -r packaging/requirements-build.txt
 ```
 
-### Build macOS app
+### Build macOS app and DMG
 
 ```bash
 bash packaging/build_mac.sh
@@ -287,7 +289,15 @@ This produces:
 
 ```text
 dist/Silence Remover.app
+dist/Silence-Remover-macOS-v0.1.0.dmg
 ```
+
+The macOS build script also:
+
+- generates the app icon automatically
+- embeds version metadata from `packaging/version.txt`
+- sets the macOS bundle identifier
+- creates a distributable `.dmg`
 
 ### Build Windows app
 
@@ -302,6 +312,8 @@ This produces a Windows standalone app build under:
 ```text
 dist\Silence Remover\
 ```
+
+The Windows build script also generates an icon and version metadata for the packaged executable.
 
 Note: the Windows standalone app path is included for users, but it has not been tested by the project author yet.
 
