@@ -289,7 +289,7 @@ This produces:
 
 ```text
 dist/Silence Remover.app
-dist/Silence-Remover-macOS-v0.1.0.dmg
+dist/Silence-Remover-macOS-v0.1.1.dmg
 ```
 
 The macOS build script also:
