@@ -13,10 +13,10 @@ from tkinter import filedialog, messagebox, ttk
 from silence_remover import ProcessResult, SilenceRemoverError, SilenceSettings, process_media
 
 
-class SilentLectureRemoverApp:
+class SilenceRemoverApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Silent Lecture Remover")
+        self.root.title("Silence Remover")
         self.root.geometry("840x640")
         self.root.minsize(760, 560)
 
@@ -27,17 +27,19 @@ class SilentLectureRemoverApp:
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
 
-        self.threshold_var = tk.StringVar(value="-42.0")
+        self.threshold_var = tk.StringVar(value="-38.0")
         self.remove_longer_var = tk.StringVar(value="0.5")
-        self.ignore_shorter_var = tk.StringVar(value="0.75")
+        self.ignore_shorter_var = tk.StringVar(value="0.85")
         self.left_padding_var = tk.StringVar(value="0.01")
         self.right_padding_var = tk.StringVar(value="0.15")
+        self.detector_var = tk.StringVar(value="adaptive")
         self.turbo_var = tk.BooleanVar(value=True)
         self.fast_mode_var = tk.BooleanVar(value=False)
         self.fast_gap_var = tk.StringVar(value="0.12")
-        default_jobs = max(1, min(4, os.cpu_count() or 1))
-        self.parallel_jobs_var = tk.StringVar(value=str(default_jobs))
+        self.accurate_merge_gap_var = tk.StringVar(value="0.08")
+        self.parallel_jobs_var = tk.StringVar(value="1")
         self.progress_text_var = tk.StringVar(value="Ready")
+        self.current_status = "Ready"
 
         self._build_ui()
         self._schedule_poll()
@@ -48,7 +50,7 @@ class SilentLectureRemoverApp:
 
         title = ttk.Label(
             frame,
-            text="TimeBolt-style Silence Remover (No Watermark)",
+            text="Silence Remover",
             font=("Helvetica", 16, "bold"),
         )
         title.pack(anchor=tk.W, pady=(0, 12))
@@ -60,7 +62,7 @@ class SilentLectureRemoverApp:
         self._file_row(file_frame, "Output Path", self.output_var, self._pick_output)
 
         settings_frame = ttk.LabelFrame(
-            frame, text="Silence Detection Options (TimeBolt Defaults)", padding=12
+            frame, text="Silence Detection Options", padding=12
         )
         settings_frame.pack(fill=tk.X, pady=(0, 12))
 
@@ -73,6 +75,16 @@ class SilentLectureRemoverApp:
         )
         self._setting_row(settings_frame, "Left Padding (sec)", self.left_padding_var)
         self._setting_row(settings_frame, "Right Padding (sec)", self.right_padding_var)
+        detector_row = ttk.Frame(settings_frame)
+        detector_row.pack(fill=tk.X, pady=4)
+        ttk.Label(detector_row, text="Detector", width=38).pack(side=tk.LEFT)
+        ttk.Combobox(
+            detector_row,
+            textvariable=self.detector_var,
+            values=("adaptive", "ffmpeg"),
+            state="readonly",
+            width=12,
+        ).pack(side=tk.LEFT)
 
         opts_frame = ttk.Frame(settings_frame)
         opts_frame.pack(fill=tk.X, pady=(8, 0))
@@ -85,15 +97,21 @@ class SilentLectureRemoverApp:
         fast_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Checkbutton(
             fast_row,
-            text="Super Fast Mode (concat-based, less precise cuts)",
+            text="Concat Mode (faster, less precise boundaries)",
             variable=self.fast_mode_var,
         ).pack(side=tk.LEFT)
         ttk.Label(fast_row, text="Merge Gap (sec):").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(fast_row, textvariable=self.fast_gap_var, width=8).pack(side=tk.LEFT)
         parallel_row = ttk.Frame(opts_frame)
         parallel_row.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(parallel_row, text="Parallel Jobs (accurate mode):").pack(side=tk.LEFT)
+        ttk.Label(parallel_row, text="Parallel Jobs (advanced):").pack(side=tk.LEFT)
         ttk.Entry(parallel_row, textvariable=self.parallel_jobs_var, width=8).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        merge_row = ttk.Frame(opts_frame)
+        merge_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(merge_row, text="Standard Merge Gap (sec):").pack(side=tk.LEFT)
+        ttk.Entry(merge_row, textvariable=self.accurate_merge_gap_var, width=8).pack(
             side=tk.LEFT, padx=(8, 0)
         )
 
@@ -166,17 +184,20 @@ class SilentLectureRemoverApp:
         return str(src.with_name(f"{src.stem}_silentcut{suffix}"))
 
     def _reset_defaults(self) -> None:
-        self.threshold_var.set("-42.0")
+        self.threshold_var.set("-38.0")
         self.remove_longer_var.set("0.5")
-        self.ignore_shorter_var.set("0.75")
+        self.ignore_shorter_var.set("0.85")
         self.left_padding_var.set("0.01")
         self.right_padding_var.set("0.15")
+        self.detector_var.set("adaptive")
         self.turbo_var.set(True)
         self.fast_mode_var.set(False)
         self.fast_gap_var.set("0.12")
-        self.parallel_jobs_var.set(str(max(1, min(4, os.cpu_count() or 1))))
-        self._append_log("Reset to TimeBolt-style defaults.")
+        self.accurate_merge_gap_var.set("0.08")
+        self.parallel_jobs_var.set("1")
+        self._append_log("Reset to default values.")
         self.progress_text_var.set("Ready")
+        self.current_status = "Ready"
 
     def _load_tuned_json(self) -> None:
         path = filedialog.askopenfilename(
@@ -234,6 +255,7 @@ class SilentLectureRemoverApp:
         except SilenceRemoverError as exc:
             messagebox.showerror("Invalid Settings", str(exc))
             return
+        detector = self.detector_var.get().strip() or "adaptive"
         turbo = self.turbo_var.get()
         render_mode = "fast" if self.fast_mode_var.get() else "accurate"
         try:
@@ -248,15 +270,28 @@ class SilentLectureRemoverApp:
         except ValueError:
             messagebox.showerror("Invalid Parallel Jobs", "Parallel Jobs must be an integer >= 1.")
             return
+        try:
+            accurate_merge_gap = float(self.accurate_merge_gap_var.get())
+            if accurate_merge_gap < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Standard Merge Gap",
+                "Standard Merge Gap must be a number >= 0.",
+            )
+            return
 
         self.progress["value"] = 0.0
         self.progress_started_at = time.monotonic()
         self.progress_text_var.set("Starting...")
+        self.current_status = "Starting..."
         self._append_log("-" * 60)
         self._append_log(f"Input: {input_path}")
         self._append_log(f"Output: {output_path}")
+        self._append_log(f"Detector: {detector}")
         self._append_log(f"Mode: {render_mode}")
         self._append_log(f"Parallel jobs: {parallel_jobs}")
+        self._append_log(f"Standard merge gap: {accurate_merge_gap:.2f}s")
         self._set_busy(True)
 
         self.worker = threading.Thread(
@@ -265,9 +300,11 @@ class SilentLectureRemoverApp:
                 input_path,
                 output_path,
                 settings,
+                detector,
                 turbo,
                 render_mode,
                 fast_merge_gap,
+                accurate_merge_gap,
                 parallel_jobs,
             ),
             daemon=True,
@@ -282,9 +319,11 @@ class SilentLectureRemoverApp:
         input_path: str,
         output_path: str,
         settings: SilenceSettings,
+        detector: str,
         turbo: bool,
         render_mode: str,
         fast_merge_gap: float,
+        accurate_merge_gap: float,
         parallel_jobs: int,
     ) -> None:
         try:
@@ -292,9 +331,11 @@ class SilentLectureRemoverApp:
                 input_path=input_path,
                 output_path=output_path,
                 settings=settings,
+                detector=detector,
                 turbo=turbo,
                 render_mode=render_mode,
                 fast_merge_gap=fast_merge_gap,
+                accurate_merge_gap=accurate_merge_gap,
                 parallel_jobs=parallel_jobs,
                 log=lambda msg: self.log_queue.put(("log", msg)),
                 progress=lambda pct: self.log_queue.put(("progress", pct)),
@@ -315,19 +356,20 @@ class SilentLectureRemoverApp:
                 return
 
             if event == "log":
-                self._append_log(str(payload))
+                message = str(payload)
+                self.current_status = message
+                self._append_log(message)
             elif event == "progress":
                 pct = float(payload)
                 self.progress["value"] = pct
                 elapsed = max(0.0, time.monotonic() - self.progress_started_at)
                 if pct <= 0.0:
-                    self.progress_text_var.set("Starting...")
+                    self.progress_text_var.set(self.current_status)
                 elif pct >= 100.0:
                     self.progress_text_var.set(f"100.0% | elapsed {elapsed:.0f}s")
                 else:
-                    eta = (elapsed * (100.0 - pct)) / max(pct, 0.001)
                     self.progress_text_var.set(
-                        f"{pct:5.1f}% | ETA ~{eta:.0f}s | elapsed {elapsed:.0f}s"
+                        f"{pct:5.1f}% | {self.current_status} | elapsed {elapsed:.0f}s"
                     )
             elif event == "done":
                 self._set_busy(False)
@@ -350,7 +392,7 @@ class SilentLectureRemoverApp:
 
 def main() -> None:
     root = tk.Tk()
-    app = SilentLectureRemoverApp(root)
+    app = SilenceRemoverApp(root)
     root.mainloop()
 
 

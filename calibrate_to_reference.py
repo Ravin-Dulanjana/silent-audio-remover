@@ -45,6 +45,7 @@ def calibrate(
     left_padding: float,
     right_padding: float,
     remove_silences_longer_than: float,
+    detector: str,
 ) -> tuple[SilenceSettings, float, float]:
     target_duration = _probe_duration(reference_output_path)
     silence_cache: dict[tuple[float, float], tuple[float, list[tuple[float, float]]]] = {}
@@ -61,7 +62,7 @@ def calibrate(
             left_padding=0.0,
             right_padding=0.0,
         )
-        duration, silences, _, _ = detect_silences(input_path, settings)
+        duration, silences, _, _ = detect_silences(input_path, settings, detector=detector)
         silence_cache[key] = (duration, silences)
         return duration, silences
 
@@ -125,14 +126,20 @@ def calibrate(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Calibrate silence settings by matching output duration to a reference TimeBolted file."
+            "Calibrate silence settings by matching output duration to a reference processed file."
         )
     )
     parser.add_argument("input", help="Original input media file")
-    parser.add_argument("reference", help="Reference (already TimeBolted) media file")
+    parser.add_argument("reference", help="Reference processed media file")
     parser.add_argument("--left-padding", type=float, default=0.01)
     parser.add_argument("--right-padding", type=float, default=0.15)
     parser.add_argument("--remove-silence-longer-than", type=float, default=0.5)
+    parser.add_argument(
+        "--detector",
+        choices=["adaptive", "ffmpeg"],
+        default="adaptive",
+        help="Silence detector backend to use while calibrating.",
+    )
     parser.add_argument(
         "--save-json",
         default="tuned_settings.json",
@@ -161,6 +168,7 @@ def main() -> int:
         left_padding=args.left_padding,
         right_padding=args.right_padding,
         remove_silences_longer_than=args.remove_silence_longer_than,
+        detector=args.detector,
     )
 
     settings_path = Path(args.save_json).expanduser().resolve()
@@ -185,6 +193,7 @@ def main() -> int:
             input_path=input_path,
             output_path=args.render_output,
             settings=tuned,
+            detector=args.detector,
             turbo=not args.no_turbo,
             log=print,
         )

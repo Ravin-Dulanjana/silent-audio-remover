@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+import numpy as np
+
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]
@@ -22,9 +24,9 @@ ProgressFn = Callable[[float], None]
 
 @dataclass(frozen=True)
 class SilenceSettings:
-    threshold_db: float = -42.0
+    threshold_db: float = -38.0
     remove_silences_longer_than: float = 0.5
-    ignore_detections_shorter_than: float = 0.75
+    ignore_detections_shorter_than: float = 0.85
     left_padding: float = 0.01
     right_padding: float = 0.15
 
@@ -141,12 +143,151 @@ def _parse_silence_intervals(text: str, duration: float) -> list[tuple[float, fl
     return _merge_intervals(intervals)
 
 
-def detect_silences(
+def _pcm_to_speech_mask(
+    pcm: np.ndarray,
+    sample_rate: int,
+    settings: SilenceSettings,
+) -> tuple[np.ndarray, float]:
+    if pcm.size == 0:
+        return np.zeros(0, dtype=bool), 0.02
+
+    frame_sec = 0.02
+    frame_size = max(1, int(sample_rate * frame_sec))
+    frame_count = pcm.size // frame_size
+    if frame_count <= 0:
+        return np.zeros(0, dtype=bool), frame_sec
+
+    trimmed = pcm[: frame_count * frame_size].reshape(frame_count, frame_size)
+    rms = np.sqrt(np.mean(trimmed * trimmed, axis=1) + 1e-12)
+    peak = np.max(np.abs(trimmed), axis=1) + 1e-12
+    rms_db = 20.0 * np.log10(rms)
+    peak_db = 20.0 * np.log10(peak)
+
+    # Blend RMS and peak so we catch speech onset more reliably than pure volume gating.
+    energy_db = (rms_db * 0.82) + (peak_db * 0.18)
+
+    smooth_window = 5
+    kernel = np.ones(smooth_window, dtype=np.float32) / smooth_window
+    smoothed = np.convolve(energy_db, kernel, mode="same")
+
+    noise_floor = float(np.percentile(smoothed, 20))
+    adaptive_threshold = max(settings.threshold_db, noise_floor + 7.5)
+    open_threshold = adaptive_threshold
+    close_threshold = adaptive_threshold - 2.0
+
+    speech = np.zeros(frame_count, dtype=bool)
+    active = False
+    for idx, value in enumerate(smoothed):
+        if active:
+            active = value >= close_threshold
+        else:
+            active = value >= open_threshold
+        speech[idx] = active
+
+    min_silence_frames = max(
+        1, int(round(settings.remove_silences_longer_than / frame_sec))
+    )
+    if min_silence_frames > 1:
+        idx = 0
+        while idx < frame_count:
+            if speech[idx]:
+                idx += 1
+                continue
+            start = idx
+            while idx < frame_count and not speech[idx]:
+                idx += 1
+            if 0 < (idx - start) < min_silence_frames:
+                speech[start:idx] = True
+
+    return speech, frame_sec
+
+
+def _speech_mask_to_silences(
+    speech: np.ndarray,
+    frame_sec: float,
+    duration: float,
+) -> list[tuple[float, float]]:
+    if speech.size == 0:
+        return [(0.0, duration)] if duration > 0 else []
+
+    silences: list[tuple[float, float]] = []
+    idx = 0
+    frame_count = speech.size
+    while idx < frame_count:
+        if speech[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < frame_count and not speech[idx]:
+            idx += 1
+        silences.append((start * frame_sec, min(duration, idx * frame_sec)))
+
+    covered = frame_count * frame_sec
+    if covered < duration and (not speech.size or not speech[-1]):
+        if silences:
+            tail_start, _tail_end = silences[-1]
+            silences[-1] = (tail_start, duration)
+        else:
+            silences.append((covered, duration))
+    return _merge_intervals(silences)
+
+
+def _detect_silences_adaptive(
+    ffmpeg: str,
+    ffprobe: str,
     input_path: Path,
     settings: SilenceSettings,
     progress: ProgressFn | None = None,
 ) -> tuple[float, list[tuple[float, float]], bool, bool]:
+    duration, has_video, has_audio = _probe_media(ffprobe, input_path)
+    if not has_audio:
+        raise SilenceRemoverError("Input has no audio track, cannot run silence detection.")
+
+    sample_rate = 16000
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        str(max(1, os.cpu_count() or 1)),
+        "-i",
+        str(input_path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+    raw = subprocess.check_output(cmd)
+    if progress is not None:
+        progress(55.0)
+    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    speech, frame_sec = _pcm_to_speech_mask(pcm, sample_rate, settings)
+    silences = _speech_mask_to_silences(speech, frame_sec, duration)
+    if progress is not None:
+        progress(100.0)
+    return duration, silences, has_video, has_audio
+
+
+def detect_silences(
+    input_path: Path,
+    settings: SilenceSettings,
+    detector: str = "adaptive",
+    progress: ProgressFn | None = None,
+) -> tuple[float, list[tuple[float, float]], bool, bool]:
     ffmpeg, ffprobe = _ensure_binaries()
+    if detector == "adaptive":
+        return _detect_silences_adaptive(ffmpeg, ffprobe, input_path, settings, progress)
+    if detector != "ffmpeg":
+        raise SilenceRemoverError("detector must be 'adaptive' or 'ffmpeg'.")
     duration, has_video, has_audio = _probe_media(ffprobe, input_path)
 
     if not has_audio:
@@ -156,9 +297,19 @@ def detect_silences(
         ffmpeg,
         "-hide_banner",
         "-nostats",
+        "-threads",
+        str(max(1, os.cpu_count() or 1)),
         "-i",
         str(input_path),
+        "-map",
+        "0:a:0",
         "-vn",
+        "-sn",
+        "-dn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
         "-af",
         f"silencedetect=n={settings.threshold_db}dB:d={settings.remove_silences_longer_than}",
         "-progress",
@@ -255,18 +406,6 @@ def _format_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def _format_eta(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    if h > 0:
-        return f"{h}h {m:02d}m {s:02d}s"
-    if m > 0:
-        return f"{m}m {s:02d}s"
-    return f"{s}s"
-
-
 def _merge_short_gaps(
     keep_segments: Sequence[tuple[float, float]], max_gap_seconds: float
 ) -> list[tuple[float, float]]:
@@ -337,6 +476,16 @@ def _run_ffmpeg_progress(
 
         log(line)
     return proc.wait()
+
+
+def _segment_duration(segments: Sequence[tuple[float, float]]) -> float:
+    return sum(end - start for start, end in segments)
+
+
+def _segment_source_span(segments: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    if not segments:
+        return 0.0, 0.0
+    return segments[0][0], segments[-1][1]
 
 
 def _render_with_concat_copy(
@@ -435,33 +584,31 @@ def _render_with_ffmpeg(
         script_path = Path(tmpdir) / "filter_complex.txt"
         filter_lines: list[str] = []
         if has_video and has_audio:
-            for idx, (start, end) in enumerate(keep_segments):
-                filter_lines.append(
-                    f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[v{idx}];"
-                )
-                filter_lines.append(
-                    f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{idx}];"
-                )
-            joined = "".join(f"[v{idx}][a{idx}]" for idx in range(len(keep_segments)))
+            expr = "+".join(
+                f"between(t\\,{start:.6f}\\,{end:.6f})" for start, end in keep_segments
+            )
             filter_lines.append(
-                f"{joined}concat=n={len(keep_segments)}:v=1:a=1[outv][outa]"
+                f"[0:v]select='{expr}',setpts=N/FRAME_RATE/TB[outv];"
+            )
+            filter_lines.append(
+                f"[0:a]aselect='{expr}',asetpts=N/SR/TB[outa]"
             )
             maps = ["-map", "[outv]", "-map", "[outa]"]
         elif has_audio:
-            for idx, (start, end) in enumerate(keep_segments):
-                filter_lines.append(
-                    f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{idx}];"
-                )
-            joined = "".join(f"[a{idx}]" for idx in range(len(keep_segments)))
-            filter_lines.append(f"{joined}concat=n={len(keep_segments)}:v=0:a=1[outa]")
+            expr = "+".join(
+                f"between(t\\,{start:.6f}\\,{end:.6f})" for start, end in keep_segments
+            )
+            filter_lines.append(
+                f"[0:a]aselect='{expr}',asetpts=N/SR/TB[outa]"
+            )
             maps = ["-map", "[outa]"]
         else:
-            for idx, (start, end) in enumerate(keep_segments):
-                filter_lines.append(
-                    f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[v{idx}];"
-                )
-            joined = "".join(f"[v{idx}]" for idx in range(len(keep_segments)))
-            filter_lines.append(f"{joined}concat=n={len(keep_segments)}:v=1:a=0[outv]")
+            expr = "+".join(
+                f"between(t\\,{start:.6f}\\,{end:.6f})" for start, end in keep_segments
+            )
+            filter_lines.append(
+                f"[0:v]select='{expr}',setpts=N/FRAME_RATE/TB[outv]"
+            )
             maps = ["-map", "[outv]"]
 
         script_path.write_text("\n".join(filter_lines), encoding="utf-8")
@@ -491,7 +638,7 @@ def _render_with_ffmpeg(
                 if use_hw:
                     cmd.extend(["-c:v", "h264_videotoolbox", "-allow_sw", "1", "-b:v", "8M"])
                 else:
-                    cmd.extend(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "22"])
+                    cmd.extend(["-c:v", "libx264", "-preset", "superfast", "-crf", "21"])
             if has_audio:
                 cmd.extend(["-c:a", "aac", "-b:a", "192k"])
             cmd.extend(["-movflags", "+faststart", str(output_path)])
@@ -616,9 +763,35 @@ def _render_with_ffmpeg_parallel(
         part_paths = [Path(tmpdir) / f"part_{idx:03d}.mp4" for idx in range(len(groups))]
         done_counter = 0
         lock = threading.Lock()
+        chunk_weights = [_segment_duration(chunk) for chunk in groups]
+        total_weight = max(0.001, sum(chunk_weights))
+        chunk_progress = [0.0 for _ in groups]
+        chunk_buckets = [-1 for _ in groups]
+
+        def _publish_progress_locked() -> None:
+            if progress is None:
+                return
+            weighted = sum(w * p for w, p in zip(chunk_weights, chunk_progress, strict=False))
+            progress(min(95.0, (weighted / total_weight) * 95.0))
 
         def _worker(idx: int, chunk: Sequence[tuple[float, float]]) -> None:
             nonlocal done_counter
+            span_start, span_end = _segment_source_span(chunk)
+            label = (
+                f"Chunk {idx + 1}/{len(groups)} "
+                f"({_format_time(span_start)} -> {_format_time(span_end)})"
+            )
+            log(f"{label} started")
+
+            def _chunk_progress(pct: float) -> None:
+                with lock:
+                    chunk_progress[idx] = max(0.0, min(1.0, pct / 100.0))
+                    bucket = int(pct // 10)
+                    if bucket > chunk_buckets[idx] and bucket < 10:
+                        chunk_buckets[idx] = bucket
+                        log(f"{label} processing {bucket * 10}%")
+                    _publish_progress_locked()
+
             _render_with_ffmpeg(
                 ffmpeg=ffmpeg,
                 input_path=input_path,
@@ -626,16 +799,16 @@ def _render_with_ffmpeg_parallel(
                 keep_segments=chunk,
                 has_video=has_video,
                 has_audio=has_audio,
-                duration=duration,
+                duration=max(0.001, chunk_weights[idx]),
                 turbo=False,
                 log=lambda _msg: None,
-                progress=None,
+                progress=_chunk_progress,
             )
             with lock:
                 done_counter += 1
-                log(f"Rendered chunk {done_counter}/{len(groups)}")
-                if progress is not None:
-                    progress(min(95.0, (done_counter / len(groups)) * 95.0))
+                chunk_progress[idx] = 1.0
+                log(f"{label} completed")
+                _publish_progress_locked()
 
         max_workers = max(1, min(parallel_jobs, len(groups)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -645,6 +818,7 @@ def _render_with_ffmpeg_parallel(
 
         if progress is not None:
             progress(96.0)
+        log("Combining rendered chunks...")
         _concat_parts_copy(
             ffmpeg=ffmpeg,
             part_paths=part_paths,
@@ -659,9 +833,11 @@ def process_media(
     input_path: str | Path,
     output_path: str | Path,
     settings: SilenceSettings = SilenceSettings(),
+    detector: str = "adaptive",
     turbo: bool = True,
     render_mode: str = "accurate",
     fast_merge_gap: float = 0.12,
+    accurate_merge_gap: float = 0.08,
     parallel_jobs: int = 1,
     log: LogFn = _default_logger,
     progress: ProgressFn | None = None,
@@ -676,9 +852,14 @@ def process_media(
         progress(0.0)
 
     ffmpeg, ffprobe = _ensure_binaries()
+    if detector == "adaptive":
+        log("Analyzing audio track with adaptive speech detection...")
+    else:
+        log("Analyzing audio track for silence...")
     duration, silences, has_video, has_audio = detect_silences(
         input_file,
         settings,
+        detector=detector,
         progress=(lambda p: progress(min(20.0, p * 0.2))) if progress is not None else None,
     )
     keep_segments = build_keep_segments(duration, silences, settings)
@@ -695,7 +876,17 @@ def process_media(
         log(
             f"Fast mode merged close cuts: {len(keep_segments)} -> {len(render_segments)} segments"
         )
-    elif render_mode != "accurate":
+    elif render_mode == "accurate":
+        if accurate_merge_gap > 0.0:
+            merged_segments = _merge_short_gaps(keep_segments, accurate_merge_gap)
+            if len(merged_segments) != len(keep_segments):
+                log(
+                    "Speed merge applied in standard mode: "
+                    f"{len(keep_segments)} -> {len(merged_segments)} segments "
+                    f"(gap <= {accurate_merge_gap:.2f}s)"
+                )
+            render_segments = merged_segments
+    else:
         raise SilenceRemoverError("render_mode must be 'accurate' or 'fast'.")
 
     kept_duration = sum(end - start for start, end in render_segments)
@@ -712,6 +903,7 @@ def process_media(
     )
 
     if render_mode == "fast":
+        log("Rendering output with concat-based pass...")
         _render_with_concat_copy(
             ffmpeg=ffmpeg,
             input_path=input_file,
@@ -719,7 +911,7 @@ def process_media(
             keep_segments=render_segments,
             has_video=has_video,
             has_audio=has_audio,
-            duration=duration,
+            duration=max(0.001, kept_duration),
             turbo=turbo,
             log=log,
             progress=render_progress,
@@ -735,12 +927,13 @@ def process_media(
                 keep_segments=render_segments,
                 has_video=has_video,
                 has_audio=has_audio,
-                duration=duration,
+                duration=max(0.001, kept_duration),
                 parallel_jobs=parallel_jobs,
                 log=log,
                 progress=render_progress,
             )
         else:
+            log("Rendering selected spans in a single pass...")
             _render_with_ffmpeg(
                 ffmpeg=ffmpeg,
                 input_path=input_file,
@@ -748,7 +941,7 @@ def process_media(
                 keep_segments=render_segments,
                 has_video=has_video,
                 has_audio=has_audio,
-                duration=duration,
+                duration=max(0.001, kept_duration),
                 turbo=turbo,
                 log=log,
                 progress=render_progress,
@@ -770,20 +963,26 @@ def process_media(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Remove silent parts from lecture videos with TimeBolt-like defaults."
+        description="Remove silent parts from video and audio files."
     )
     parser.add_argument("input", help="Input video/audio path")
     parser.add_argument("output", help="Output path")
-    parser.add_argument("--threshold-db", type=float, default=-42.0)
+    parser.add_argument("--threshold-db", type=float, default=-38.0)
     parser.add_argument("--remove-silence-longer-than", type=float, default=0.5)
-    parser.add_argument("--ignore-detections-shorter-than", type=float, default=0.75)
+    parser.add_argument("--ignore-detections-shorter-than", type=float, default=0.85)
     parser.add_argument("--left-padding", type=float, default=0.01)
     parser.add_argument("--right-padding", type=float, default=0.15)
+    parser.add_argument(
+        "--detector",
+        choices=["adaptive", "ffmpeg"],
+        default="adaptive",
+        help="Silence detector backend. adaptive uses a NumPy speech-style detector and is the default.",
+    )
     parser.add_argument(
         "--render-mode",
         choices=["accurate", "fast"],
         default="accurate",
-        help="accurate = precise cuts + re-encode; fast = faster concat-based render, less exact timing.",
+        help="accurate = single-pass precise cuts; fast = concat-based render with less exact boundaries.",
     )
     parser.add_argument(
         "--fast-merge-gap",
@@ -792,10 +991,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="In fast mode, merge cuts separated by <= this many seconds to boost speed.",
     )
     parser.add_argument(
+        "--accurate-merge-gap",
+        type=float,
+        default=0.08,
+        help="In standard mode, merge tiny gaps <= this many seconds to reduce cut count and speed up rendering.",
+    )
+    parser.add_argument(
         "--parallel-jobs",
         type=int,
         default=1,
-        help="For accurate mode: render chunks in parallel workers, then concat.",
+        help="Advanced option: split the render into worker chunks, then concat them.",
     )
     parser.add_argument(
         "--no-turbo",
@@ -825,14 +1030,7 @@ def main() -> int:
         if pct < 100.0 and (pct - last_progress["pct"]) < 1.5 and (now - last_progress["ts"]) < 3.0:
             return
         elapsed = now - started
-        if pct > 0.0:
-            eta = elapsed * (100.0 - pct) / pct
-            print(
-                f"[{pct:5.1f}%] elapsed {_format_eta(elapsed)} | "
-                f"eta {_format_eta(eta)}"
-            )
-        else:
-            print("[  0.0%] starting...")
+        print(f"[{pct:5.1f}%] elapsed {_format_time(elapsed)}")
         last_progress["pct"] = pct
         last_progress["ts"] = now
 
@@ -841,9 +1039,11 @@ def main() -> int:
             input_path=args.input,
             output_path=args.output,
             settings=settings,
+            detector=args.detector,
             turbo=not args.no_turbo,
             render_mode=args.render_mode,
             fast_merge_gap=args.fast_merge_gap,
+            accurate_merge_gap=max(0.0, args.accurate_merge_gap),
             parallel_jobs=max(1, args.parallel_jobs),
             log=_default_logger,
             progress=_cli_progress,

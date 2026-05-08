@@ -1,21 +1,22 @@
-# Silent Lecture Remover
+# Silence Remover
 
-Silent Lecture Remover is a local Python app for trimming silence from lecture videos and audio recordings without adding watermarks. It was built as a practical alternative to tools like TimeBolt for students and anyone who wants faster, cleaner lecture playback.
+Silence Remover is a local Python app for trimming silence from video and audio recordings without adding watermarks. It was built as a practical alternative to tools like TimeBolt for anyone who wants faster, cleaner playback while keeping the workflow fully local.
 
 The project includes:
 
 - a desktop GUI built with `tkinter`
 - a CLI for batch-style usage
 - tunable silence-detection settings
-- live progress percentage and ETA
-- parallel rendering for faster accurate exports
+- live progress percentage and active processing status
+- fast single-pass rendering for precise exports
+- an adaptive speech-style detector for stronger silence removal
 - a calibration tool for matching a reference output
 
 ## Why this project exists
 
 Many silence-removal tools are convenient, but free versions often watermark exported videos. This project focuses on keeping the workflow local and simple:
 
-- select a lecture file
+- select a media file
 - detect silent parts
 - export a shorter version without watermarking
 
@@ -31,10 +32,11 @@ It is especially useful for:
 - Watermark-free local processing
 - Desktop app with file picker and editable detection settings
 - CLI for scripting and repeatable runs
-- Live progress reporting with ETA
-- Accurate mode for precise cuts
-- Parallel accurate mode for better speed on multi-core machines
-- Fast mode for quicker but less exact cut timing
+- Live progress reporting with active processing status
+- Standard mode for precise cuts
+- Optional parallel chunk rendering for advanced cases
+- Concat mode for quicker but less exact cut timing
+- Adaptive detector as the default backend
 - Calibration utility to tune settings against a reference output
 - JSON import for tuned settings in the GUI
 
@@ -42,13 +44,14 @@ It is especially useful for:
 
 The default detection values were chosen to mirror the TimeBolt-style setup used during development:
 
-- `Filter Below Sound Level`: `-42.0 dB`
+- `Filter Below Sound Level`: `-38.0 dB`
 - `Remove Silences Longer Than`: `0.5 sec`
-- `Ignore Detections Shorter Than`: `0.75 sec`
+- `Ignore Detections Shorter Than`: `0.85 sec`
 - `Left Padding`: `0.01 sec`
 - `Right Padding`: `0.15 sec`
+- `Detector`: `adaptive`
 
-These are a reasonable starting point for lecture recordings, but you can tune them for noisier or quieter material.
+These are a reasonable starting point for spoken-content recordings, but you can tune them for noisier or quieter material.
 
 ## Requirements
 
@@ -104,9 +107,10 @@ From the app you can:
 - choose an input video or audio file
 - choose an output path
 - edit silence-detection settings
-- use parallel rendering for faster accurate exports
+- use the default fast single-pass renderer
+- use the adaptive detector by default
 - load tuned settings from a JSON file
-- watch live progress and ETA
+- watch live progress and current processing stage
 
 ### Run from the CLI
 
@@ -119,16 +123,16 @@ python3 silence_remover.py input.mp4 output.mp4
 Basic example:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4
+python3 silence_remover.py input.mp4 trimmed.mp4
 ```
 
 Use custom silence settings:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 \
-  --threshold-db -42 \
+python3 silence_remover.py input.mp4 trimmed.mp4 \
+  --threshold-db -38 \
   --remove-silence-longer-than 0.5 \
-  --ignore-detections-shorter-than 0.75 \
+  --ignore-detections-shorter-than 0.85 \
   --left-padding 0.01 \
   --right-padding 0.15
 ```
@@ -136,22 +140,19 @@ python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 \
 Disable hardware encode fallback attempts:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 --no-turbo
+python3 silence_remover.py input.mp4 trimmed.mp4 --no-turbo
 ```
 
-Use accurate mode with parallel workers:
+Use the default standard mode:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 \
-  --render-mode accurate \
-  --parallel-jobs 4 \
-  --no-turbo
+python3 silence_remover.py input.mp4 trimmed.mp4 --no-turbo
 ```
 
-Use fast mode:
+Use concat mode:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed_fast.mp4 \
+python3 silence_remover.py input.mp4 trimmed_fast.mp4 \
   --render-mode fast \
   --fast-merge-gap 0.12 \
   --no-turbo
@@ -166,9 +167,10 @@ python3 silence_remover.py lecture.mp4 lecture_trimmed_fast.mp4 \
 - `--ignore-detections-shorter-than`: minimum speech segment length to keep
 - `--left-padding`: audio/video padding before kept speech
 - `--right-padding`: audio/video padding after kept speech
-- `--render-mode accurate|fast`: choose between precision and speed
+- `--detector adaptive|ffmpeg`: choose the detection backend
+- `--render-mode accurate|fast`: choose between the default single-pass renderer and concat mode
 - `--fast-merge-gap`: merge nearby cuts in fast mode
-- `--parallel-jobs`: number of workers for accurate parallel rendering
+- `--parallel-jobs`: advanced worker count for chunked rendering
 - `--no-turbo`: disable hardware encoder attempts
 
 ## GUI usage
@@ -177,22 +179,23 @@ The desktop app in [app.py](/Users/ravinfernando/dev/silent-audio-remover/app.py
 
 ### Main controls
 
-- `Input Video/Audio`: the lecture or recording to process
+- `Input Video/Audio`: the media file to process
 - `Output Path`: destination file
 - `Filter Below Sound Level`: silence threshold
 - `Remove Silences Longer Than`: minimum silence duration to remove
 - `Ignore Detections Shorter Than`: minimum non-silence duration to preserve
 - `Left Padding` / `Right Padding`: padding around preserved speech
+- `Detector`: adaptive is the default and usually removes more silence
 - `Turbo Encode`: attempts hardware encoding where possible
-- `Super Fast Mode`: faster but less exact output timing
-- `Parallel Jobs`: concurrent accurate rendering workers
+- `Concat Mode`: faster but less exact output timing
+- `Parallel Jobs`: advanced chunk rendering workers
 
 ### Progress display
 
 The app shows:
 
 - current completion percentage
-- estimated time remaining
+- current processing stage
 - elapsed processing time
 - log messages for each stage
 
@@ -200,19 +203,21 @@ The app shows:
 
 There are two main rendering modes:
 
-### Accurate mode
+### Standard mode
 
-- Best choice for lecture videos
-- Re-encodes the output for precise cuts
-- Supports `--parallel-jobs` to speed up long exports
+- Best choice for most files
+- Uses a single-pass FFmpeg selection render for precise cuts
+- Pairs well with the default adaptive detector for stronger silence trimming
+- Usually faster than the older chunked render path
+- Supports `--parallel-jobs` as an advanced option, though it can be slower on some machines
 
 Recommended:
 
 ```bash
-python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 --parallel-jobs 4 --no-turbo
+python3 silence_remover.py input.mp4 trimmed.mp4 --no-turbo
 ```
 
-### Fast mode
+### Concat mode
 
 - Tries to reduce render overhead
 - Cut timing can be less exact around boundaries
@@ -223,7 +228,8 @@ python3 silence_remover.py lecture.mp4 lecture_trimmed.mp4 --parallel-jobs 4 --n
 For most users:
 
 - keep `accurate` mode
-- set `parallel-jobs` to `2` or `4`
+- keep `adaptive` detector
+- leave `parallel-jobs` at `1` unless you have tested a benefit on your machine
 - use `--no-turbo` if hardware encoding is unreliable on your machine
 
 ## Calibration against a reference output
@@ -281,7 +287,7 @@ python3 -m py_compile silence_remover.py app.py calibrate_to_reference.py test_s
 
 ### Suggested repository description
 
-Watermark-free Python app to remove silence from lecture videos with a GUI, CLI, progress ETA, and parallel processing.
+Watermark-free Python app to remove silence from video and audio files with a GUI, CLI, live progress, and fast local processing.
 
 ### Suggested topics
 
@@ -290,7 +296,7 @@ Watermark-free Python app to remove silence from lecture videos with a GUI, CLI,
 - `video-editing`
 - `audio-processing`
 - `silence-removal`
-- `lecture-tools`
+- `media-tools`
 - `tkinter`
 
 ## License
