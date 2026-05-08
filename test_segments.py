@@ -4,6 +4,7 @@ import numpy as np
 from silence_remover import (
     SilenceSettings,
     _pcm_to_speech_mask,
+    _split_segments_by_count,
     _speech_mask_to_silences,
     build_keep_segments,
 )
@@ -73,3 +74,13 @@ def test_pcm_detector_fills_short_silent_gap() -> None:
     speech, frame_sec = _pcm_to_speech_mask(pcm, sample_rate=sample_rate, settings=settings)
     assert frame_sec == 0.02
     assert speech[6:14].all()
+
+
+def test_split_segments_by_count() -> None:
+    segments = [(float(idx), float(idx + 1)) for idx in range(7)]
+    groups = _split_segments_by_count(segments, max_segments_per_group=3)
+    assert groups == [
+        [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)],
+        [(3.0, 4.0), (4.0, 5.0), (5.0, 6.0)],
+        [(6.0, 7.0)],
+    ]

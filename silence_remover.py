@@ -488,6 +488,21 @@ def _segment_source_span(segments: Sequence[tuple[float, float]]) -> tuple[float
     return segments[0][0], segments[-1][1]
 
 
+def _split_segments_by_count(
+    keep_segments: Sequence[tuple[float, float]], max_segments_per_group: int
+) -> list[list[tuple[float, float]]]:
+    if max_segments_per_group <= 0:
+        raise ValueError("max_segments_per_group must be >= 1")
+    if not keep_segments:
+        return []
+    if len(keep_segments) <= max_segments_per_group:
+        return [list(keep_segments)]
+    return [
+        list(keep_segments[idx : idx + max_segments_per_group])
+        for idx in range(0, len(keep_segments), max_segments_per_group)
+    ]
+
+
 def _render_with_concat_copy(
     ffmpeg: str,
     input_path: Path,
@@ -563,7 +578,7 @@ def _render_with_concat_copy(
             raise SilenceRemoverError(f"ffmpeg fast render failed with exit code {code}.")
 
 
-def _render_with_ffmpeg(
+def _render_with_ffmpeg_singlepass(
     ffmpeg: str,
     input_path: Path,
     output_path: Path,
@@ -656,6 +671,131 @@ def _render_with_ffmpeg(
 
     if progress is not None:
         progress(100.0)
+
+
+def _render_with_ffmpeg_batched(
+    ffmpeg: str,
+    input_path: Path,
+    output_path: Path,
+    keep_segments: Sequence[tuple[float, float]],
+    has_video: bool,
+    has_audio: bool,
+    duration: float,
+    turbo: bool,
+    log: LogFn,
+    progress: ProgressFn | None = None,
+    max_segments_per_pass: int = 48,
+) -> None:
+    groups = _split_segments_by_count(keep_segments, max_segments_per_pass)
+    if len(groups) <= 1:
+        _render_with_ffmpeg_singlepass(
+            ffmpeg=ffmpeg,
+            input_path=input_path,
+            output_path=output_path,
+            keep_segments=keep_segments,
+            has_video=has_video,
+            has_audio=has_audio,
+            duration=duration,
+            turbo=turbo,
+            log=log,
+            progress=progress,
+        )
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log(
+        "Batch render enabled: "
+        f"{len(keep_segments)} kept segments split into {len(groups)} passes"
+    )
+    group_weights = [_segment_duration(group) for group in groups]
+    total_weight = max(0.001, sum(group_weights))
+
+    with tempfile.TemporaryDirectory(prefix="silent-batched-") as tmpdir:
+        part_paths = [Path(tmpdir) / f"batch_{idx:03d}.mp4" for idx in range(len(groups))]
+        completed_weight = 0.0
+
+        for idx, group in enumerate(groups):
+            span_start, span_end = _segment_source_span(group)
+            label = (
+                f"Batch {idx + 1}/{len(groups)} "
+                f"({_format_time(span_start)} -> {_format_time(span_end)})"
+            )
+            log(f"{label} started")
+
+            def _batch_progress(pct: float) -> None:
+                if progress is None:
+                    return
+                current = completed_weight + (group_weights[idx] * max(0.0, min(100.0, pct)) / 100.0)
+                progress(min(95.0, (current / total_weight) * 95.0))
+
+            _render_with_ffmpeg_singlepass(
+                ffmpeg=ffmpeg,
+                input_path=input_path,
+                output_path=part_paths[idx],
+                keep_segments=group,
+                has_video=has_video,
+                has_audio=has_audio,
+                duration=max(0.001, group_weights[idx]),
+                turbo=turbo,
+                log=lambda _msg: None,
+                progress=_batch_progress,
+            )
+            completed_weight += group_weights[idx]
+            log(f"{label} completed")
+
+        if progress is not None:
+            progress(96.0)
+        log("Combining rendered batches...")
+        _concat_parts_copy(
+            ffmpeg=ffmpeg,
+            part_paths=part_paths,
+            output_path=output_path,
+            duration=duration,
+            log=log,
+            progress=progress,
+        )
+
+
+def _render_with_ffmpeg(
+    ffmpeg: str,
+    input_path: Path,
+    output_path: Path,
+    keep_segments: Sequence[tuple[float, float]],
+    has_video: bool,
+    has_audio: bool,
+    duration: float,
+    turbo: bool,
+    log: LogFn,
+    progress: ProgressFn | None = None,
+) -> None:
+    max_segments_per_pass = 48
+    if len(keep_segments) > max_segments_per_pass:
+        _render_with_ffmpeg_batched(
+            ffmpeg=ffmpeg,
+            input_path=input_path,
+            output_path=output_path,
+            keep_segments=keep_segments,
+            has_video=has_video,
+            has_audio=has_audio,
+            duration=duration,
+            turbo=turbo,
+            log=log,
+            progress=progress,
+            max_segments_per_pass=max_segments_per_pass,
+        )
+        return
+    _render_with_ffmpeg_singlepass(
+        ffmpeg=ffmpeg,
+        input_path=input_path,
+        output_path=output_path,
+        keep_segments=keep_segments,
+        has_video=has_video,
+        has_audio=has_audio,
+        duration=duration,
+        turbo=turbo,
+        log=log,
+        progress=progress,
+    )
 
 
 def _split_segments_for_parallel(
