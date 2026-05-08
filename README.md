@@ -295,4 +295,4 @@ Watermark-free Python app to remove silence from lecture videos with a GUI, CLI,
 
 ## License
 
-Add the license you want before publishing. If you want a simple default, MIT is usually a good fit for a utility project like this.
+This project is licensed under the Apache License 2.0. See [LICENSE](/Users/ravinfernando/dev/silent-audio-remover/LICENSE) for details.
