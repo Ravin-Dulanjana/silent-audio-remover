@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import queue
 import threading
-import tkinter as tk
-import json
-import os
 import time
+import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -34,9 +33,9 @@ class SilenceRemoverApp:
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
 
-        self.threshold_var = tk.StringVar(value="-38.0")
+        self.threshold_var = tk.StringVar(value="-42.0")
         self.remove_longer_var = tk.StringVar(value="0.5")
-        self.ignore_shorter_var = tk.StringVar(value="0.85")
+        self.ignore_shorter_var = tk.StringVar(value="0.75")
         self.left_padding_var = tk.StringVar(value="0.01")
         self.right_padding_var = tk.StringVar(value="0.15")
         self.detector_var = tk.StringVar(value="adaptive")
@@ -112,16 +111,11 @@ class SilenceRemoverApp:
         self._bind_mousewheel(self.canvas)
         self._bind_mousewheel(self.content)
 
-        title = ttk.Label(
-            self.content,
-            text="Silence Remover",
-            style="Title.TLabel",
-        )
+        title = ttk.Label(self.content, text="Silence Remover", style="Title.TLabel")
         title.pack(anchor=tk.W, pady=(0, 12))
 
         file_frame = ttk.LabelFrame(self.content, text="Files", style="Card.TLabelframe")
         file_frame.pack(fill=tk.X, pady=(0, 12))
-
         self._file_row(file_frame, "Input Video/Audio", self.input_var, self._pick_input)
         self._file_row(file_frame, "Output Path", self.output_var, self._pick_output)
 
@@ -129,7 +123,6 @@ class SilenceRemoverApp:
             self.content, text="Silence Detection Options", style="Card.TLabelframe"
         )
         settings_frame.pack(fill=tk.X, pady=(0, 12))
-
         self._setting_row(settings_frame, "Filter Below Sound Level (dB)", self.threshold_var)
         self._setting_row(
             settings_frame, "Remove Silences Longer Than (sec)", self.remove_longer_var
@@ -139,6 +132,7 @@ class SilenceRemoverApp:
         )
         self._setting_row(settings_frame, "Left Padding (sec)", self.left_padding_var)
         self._setting_row(settings_frame, "Right Padding (sec)", self.right_padding_var)
+
         detector_row = ttk.Frame(settings_frame)
         detector_row.pack(fill=tk.X, pady=4)
         ttk.Label(detector_row, text="Detector", width=38).pack(side=tk.LEFT)
@@ -160,6 +154,7 @@ class SilenceRemoverApp:
             text="Turbo Encode (use Apple hardware encoder if available)",
             variable=self.turbo_var,
         ).pack(anchor=tk.W)
+
         fast_row = ttk.Frame(opts_frame)
         fast_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Checkbutton(
@@ -169,12 +164,14 @@ class SilenceRemoverApp:
         ).pack(side=tk.LEFT)
         ttk.Label(fast_row, text="Merge Gap (sec):").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(fast_row, textvariable=self.fast_gap_var, width=8).pack(side=tk.LEFT)
+
         parallel_row = ttk.Frame(opts_frame)
         parallel_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(parallel_row, text="Parallel Jobs (advanced):").pack(side=tk.LEFT)
         ttk.Entry(parallel_row, textvariable=self.parallel_jobs_var, width=8).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+
         merge_row = ttk.Frame(opts_frame)
         merge_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(merge_row, text="Standard Merge Gap (sec):").pack(side=tk.LEFT)
@@ -185,23 +182,27 @@ class SilenceRemoverApp:
         actions = ttk.Frame(self.content)
         actions.pack(fill=tk.X, pady=(0, 12))
         self.start_btn = ttk.Button(
-            actions, text="Export Video", command=self._start, style="Action.TButton", default="active"
+            actions,
+            text="Export Video",
+            command=self._start,
+            style="Action.TButton",
+            default="active",
         )
         self.start_btn.pack(side=tk.LEFT)
         self.stop_btn = ttk.Button(
-            actions, text="Stop", command=self._request_stop, style="Stop.TButton", state=tk.DISABLED
+            actions,
+            text="Stop",
+            command=self._request_stop,
+            style="Stop.TButton",
+            state=tk.DISABLED,
         )
         self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             actions, text="Reset Defaults", command=self._reset_defaults, style="Secondary.TButton"
-        ).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             actions, text="Load Tuned JSON", command=self._load_tuned_json, style="Secondary.TButton"
-        ).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(self.content, orient=tk.HORIZONTAL, mode="determinate")
         self.progress.pack(fill=tk.X, pady=(0, 8))
@@ -209,7 +210,7 @@ class SilenceRemoverApp:
 
         log_frame = ttk.LabelFrame(self.content, text="Log", style="Card.TLabelframe")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        self.log = tk.Text(log_frame, height=12, wrap="word")
+        self.log = tk.Text(log_frame, height=16, wrap="word")
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -313,9 +314,9 @@ class SilenceRemoverApp:
         return str(src.with_name(f"{src.stem}_silentcut{suffix}"))
 
     def _reset_defaults(self) -> None:
-        self.threshold_var.set("-38.0")
+        self.threshold_var.set("-42.0")
         self.remove_longer_var.set("0.5")
-        self.ignore_shorter_var.set("0.85")
+        self.ignore_shorter_var.set("0.75")
         self.left_padding_var.set("0.01")
         self.right_padding_var.set("0.15")
         self.detector_var.set("adaptive")
@@ -392,6 +393,7 @@ class SilenceRemoverApp:
         except SilenceRemoverError as exc:
             messagebox.showerror("Invalid Settings", str(exc))
             return
+
         detector = self.detector_var.get().strip() or "adaptive"
         turbo = self.turbo_var.get()
         render_mode = "fast" if self.fast_mode_var.get() else "accurate"
@@ -572,7 +574,7 @@ class SilenceRemoverApp:
 
 def main() -> None:
     root = tk.Tk()
-    app = SilenceRemoverApp(root)
+    SilenceRemoverApp(root)
     root.mainloop()
 
 

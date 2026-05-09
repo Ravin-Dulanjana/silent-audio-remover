@@ -24,9 +24,9 @@ ProgressFn = Callable[[float], None]
 
 @dataclass(frozen=True)
 class SilenceSettings:
-    threshold_db: float = -38.0
+    threshold_db: float = -42.0
     remove_silences_longer_than: float = 0.5
-    ignore_detections_shorter_than: float = 0.85
+    ignore_detections_shorter_than: float = 0.75
     left_padding: float = 0.01
     right_padding: float = 0.15
 
@@ -182,6 +182,19 @@ def _pcm_to_speech_mask(
     peak = np.max(np.abs(trimmed), axis=1) + 1e-12
     rms_db = 20.0 * np.log10(rms)
     peak_db = 20.0 * np.log10(peak)
+    return _frame_stats_to_speech_mask(rms_db, peak_db, settings), frame_sec
+
+
+def _frame_stats_to_speech_mask(
+    rms_db: np.ndarray,
+    peak_db: np.ndarray,
+    settings: SilenceSettings,
+    frame_sec: float = 0.02,
+) -> np.ndarray:
+    if rms_db.size == 0 or peak_db.size == 0:
+        return np.zeros(0, dtype=bool)
+    if rms_db.size != peak_db.size:
+        raise ValueError("rms_db and peak_db must have the same length")
 
     # Blend RMS and peak so we catch speech onset more reliably than pure volume gating.
     energy_db = (rms_db * 0.82) + (peak_db * 0.18)
@@ -195,7 +208,7 @@ def _pcm_to_speech_mask(
     open_threshold = adaptive_threshold
     close_threshold = adaptive_threshold - 2.0
 
-    speech = np.zeros(frame_count, dtype=bool)
+    speech = np.zeros(rms_db.size, dtype=bool)
     active = False
     for idx, value in enumerate(smoothed):
         if active:
@@ -209,17 +222,17 @@ def _pcm_to_speech_mask(
     )
     if min_silence_frames > 1:
         idx = 0
-        while idx < frame_count:
+        while idx < speech.size:
             if speech[idx]:
                 idx += 1
                 continue
             start = idx
-            while idx < frame_count and not speech[idx]:
+            while idx < speech.size and not speech[idx]:
                 idx += 1
             if 0 < (idx - start) < min_silence_frames:
                 speech[start:idx] = True
 
-    return speech, frame_sec
+    return speech
 
 
 def _speech_mask_to_silences(
@@ -466,6 +479,22 @@ def _merge_short_gaps(
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+def _apply_render_segment_mode(
+    keep_segments: Sequence[tuple[float, float]],
+    render_mode: str,
+    fast_merge_gap: float,
+    accurate_merge_gap: float,
+) -> list[tuple[float, float]]:
+    render_segments = list(keep_segments)
+    if render_mode == "fast":
+        return _merge_short_gaps(render_segments, max(0.0, fast_merge_gap))
+    if render_mode == "accurate":
+        if accurate_merge_gap > 0.0:
+            return _merge_short_gaps(render_segments, accurate_merge_gap)
+        return render_segments
+    raise SilenceRemoverError("render_mode must be 'accurate' or 'fast'.")
 
 
 def _run_ffmpeg_progress(
@@ -1097,24 +1126,22 @@ def process_media(
                 "Try reducing 'Ignore Detections Shorter Than'."
             )
 
-        render_segments = keep_segments
+        render_segments = _apply_render_segment_mode(
+            keep_segments=keep_segments,
+            render_mode=render_mode,
+            fast_merge_gap=fast_merge_gap,
+            accurate_merge_gap=accurate_merge_gap,
+        )
         if render_mode == "fast":
-            render_segments = _merge_short_gaps(keep_segments, max(0.0, fast_merge_gap))
             log(
                 f"Fast mode merged close cuts: {len(keep_segments)} -> {len(render_segments)} segments"
             )
-        elif render_mode == "accurate":
-            if accurate_merge_gap > 0.0:
-                merged_segments = _merge_short_gaps(keep_segments, accurate_merge_gap)
-                if len(merged_segments) != len(keep_segments):
-                    log(
-                        "Speed merge applied in standard mode: "
-                        f"{len(keep_segments)} -> {len(merged_segments)} segments "
-                        f"(gap <= {accurate_merge_gap:.2f}s)"
-                    )
-                render_segments = merged_segments
-        else:
-            raise SilenceRemoverError("render_mode must be 'accurate' or 'fast'.")
+        elif len(render_segments) != len(keep_segments):
+            log(
+                "Speed merge applied in standard mode: "
+                f"{len(keep_segments)} -> {len(render_segments)} segments "
+                f"(gap <= {accurate_merge_gap:.2f}s)"
+            )
 
         kept_duration = sum(end - start for start, end in render_segments)
         removed_duration = max(0.0, duration - kept_duration)
@@ -1202,9 +1229,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input", help="Input video/audio path")
     parser.add_argument("output", help="Output path")
-    parser.add_argument("--threshold-db", type=float, default=-38.0)
+    parser.add_argument("--threshold-db", type=float, default=-42.0)
     parser.add_argument("--remove-silence-longer-than", type=float, default=0.5)
-    parser.add_argument("--ignore-detections-shorter-than", type=float, default=0.85)
+    parser.add_argument("--ignore-detections-shorter-than", type=float, default=0.75)
     parser.add_argument("--left-padding", type=float, default=0.01)
     parser.add_argument("--right-padding", type=float, default=0.15)
     parser.add_argument(
