@@ -27,13 +27,13 @@ def test_ignore_short_detections() -> None:
     settings = SilenceSettings(
         threshold_db=-42.0,
         remove_silences_longer_than=0.5,
-        ignore_detections_shorter_than=1.0,
+        ignore_detections_shorter_than=0.5,
         left_padding=0.0,
         right_padding=0.0,
     )
-    silences = [(0.0, 2.0), (2.3, 10.0)]
+    silences = [(0.0, 2.0), (5.0, 5.4), (8.0, 10.0)]
     keep = build_keep_segments(duration=10.0, silence_intervals=silences, settings=settings)
-    assert keep == []
+    assert keep == [(2.0, 8.0)]
 
 
 def test_padding_and_merge() -> None:

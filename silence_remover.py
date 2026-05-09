@@ -403,7 +403,13 @@ def build_keep_segments(
     if duration <= 0:
         return []
 
-    silences = _merge_intervals(silence_intervals)
+    silences = _merge_intervals(
+        [
+            (start, end)
+            for start, end in silence_intervals
+            if (end - start) >= settings.ignore_detections_shorter_than
+        ]
+    )
     keep: list[tuple[float, float]] = []
 
     cursor = 0.0
@@ -413,12 +419,6 @@ def build_keep_segments(
         cursor = max(cursor, end)
     if cursor < duration:
         keep.append((cursor, duration))
-
-    keep = [
-        (start, end)
-        for start, end in keep
-        if (end - start) >= settings.ignore_detections_shorter_than
-    ]
     if not keep:
         return []
 

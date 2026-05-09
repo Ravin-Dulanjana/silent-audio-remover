@@ -47,6 +47,8 @@ class SilenceRemoverApp:
         self.parallel_jobs_var = tk.StringVar(value="1")
         self.progress_text_var = tk.StringVar(value="Ready")
         self.current_status = "Ready"
+        self._poll_interval_ms = 50
+        self._max_events_per_poll = 40
 
         self._configure_styles()
         self._build_ui()
@@ -351,6 +353,14 @@ class SilenceRemoverApp:
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
 
+    def _append_logs(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, "\n".join(lines) + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
     def _parse_settings(self) -> SilenceSettings:
         try:
             return SilenceSettings(
@@ -488,57 +498,76 @@ class SilenceRemoverApp:
 
     def _schedule_poll(self) -> None:
         self._poll_queue()
-        self.root.after(25, self._schedule_poll)
+        self.root.after(self._poll_interval_ms, self._schedule_poll)
 
     def _poll_queue(self) -> None:
-        while True:
+        log_lines: list[str] = []
+        latest_progress: float | None = None
+        terminal_event: tuple[str, object] | None = None
+        processed = 0
+
+        while processed < self._max_events_per_poll:
             try:
                 event, payload = self.log_queue.get_nowait()
             except queue.Empty:
-                return
+                break
+            processed += 1
 
             if event == "log":
                 message = str(payload)
                 self.current_status = message
-                self._append_log(message)
+                log_lines.append(message)
             elif event == "progress":
-                pct = float(payload)
-                self.progress["value"] = pct
-                elapsed = max(0.0, time.monotonic() - self.progress_started_at)
-                if pct <= 0.0:
-                    self.progress_text_var.set(self.current_status)
-                elif pct >= 100.0:
-                    self.progress_text_var.set(f"100.0% | elapsed {elapsed:.0f}s")
-                else:
-                    self.progress_text_var.set(
-                        f"{pct:5.1f}% | {self.current_status} | elapsed {elapsed:.0f}s"
-                    )
-            elif event == "done":
-                self._set_busy(False)
-                self.cancel_event = None
-                assert isinstance(payload, ProcessResult)
-                self.progress["value"] = 100.0
-                elapsed = max(0.0, time.monotonic() - self.progress_started_at)
-                self.progress_text_var.set(f"Done in {elapsed:.1f}s")
-                self._append_log(
-                    f"Done. Output duration: {payload.output_duration:.2f}s "
-                    f"(removed {payload.removed_duration:.2f}s)"
+                latest_progress = float(payload)
+            elif event in {"done", "cancelled", "error"}:
+                terminal_event = (event, payload)
+                break
+
+        self._append_logs(log_lines)
+
+        if latest_progress is not None:
+            pct = latest_progress
+            self.progress["value"] = pct
+            elapsed = max(0.0, time.monotonic() - self.progress_started_at)
+            if pct <= 0.0:
+                self.progress_text_var.set(self.current_status)
+            elif pct >= 100.0:
+                self.progress_text_var.set(f"100.0% | elapsed {elapsed:.0f}s")
+            else:
+                self.progress_text_var.set(
+                    f"{pct:5.1f}% | {self.current_status} | elapsed {elapsed:.0f}s"
                 )
-                messagebox.showinfo("Completed", f"Export completed:\n{payload.output_path}")
-            elif event == "cancelled":
-                self._set_busy(False)
-                self.cancel_event = None
-                self.progress["value"] = 0.0
-                self.progress_text_var.set("Stopped")
-                self.current_status = "Stopped"
-                self._append_log("Export stopped.")
-            elif event == "error":
-                self._set_busy(False)
-                self.cancel_event = None
-                self.progress["value"] = 0.0
-                self.progress_text_var.set("Failed")
-                self._append_log(f"ERROR: {payload}")
-                messagebox.showerror("Export Failed", str(payload))
+
+        if terminal_event is None:
+            return
+
+        event, payload = terminal_event
+        if event == "done":
+            self._set_busy(False)
+            self.cancel_event = None
+            assert isinstance(payload, ProcessResult)
+            self.progress["value"] = 100.0
+            elapsed = max(0.0, time.monotonic() - self.progress_started_at)
+            self.progress_text_var.set(f"Done in {elapsed:.1f}s")
+            self._append_log(
+                f"Done. Output duration: {payload.output_duration:.2f}s "
+                f"(removed {payload.removed_duration:.2f}s)"
+            )
+            messagebox.showinfo("Completed", f"Export completed:\n{payload.output_path}")
+        elif event == "cancelled":
+            self._set_busy(False)
+            self.cancel_event = None
+            self.progress["value"] = 0.0
+            self.progress_text_var.set("Stopped")
+            self.current_status = "Stopped"
+            self._append_log("Export stopped.")
+        elif event == "error":
+            self._set_busy(False)
+            self.cancel_event = None
+            self.progress["value"] = 0.0
+            self.progress_text_var.set("Failed")
+            self._append_log(f"ERROR: {payload}")
+            messagebox.showerror("Export Failed", str(payload))
 
 
 def main() -> None:
